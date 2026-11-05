@@ -1,0 +1,22 @@
+# Transcription hints for Whisper.
+#
+# Everything below that isn't a comment (lines starting with "#") is joined
+# into one block and passed to Whisper as its "initial prompt". Whisper reads
+# it as if it were the transcript that came just before the recording, and
+# tends to copy its style: spelling, number format, punctuation, vocabulary.
+#
+# It's a strong nudge, not a rule. To guarantee the output format, server.py
+# also cleans up every transcript (see normalize_digits): number words become
+# digits and everything that isn't a digit is removed, so "four, one. 3-5"
+# becomes 4135.
+#
+# Tips:
+# - Write example text in exactly the format you want back: digits only,
+#   with no commas, periods or dashes.
+# - Keep it short. Whisper uses only roughly the last 220 tokens, about
+#   150 words, and long prompts slow it down a little.
+# - Leave this file empty, or all comments, to turn hints off.
+# - The server re-reads this file on every recording, so edits apply
+#   immediately with no restart.
+
+4135 7 209 88162 300 5 61 9047 0 23 1111 947 4444

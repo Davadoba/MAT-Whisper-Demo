@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whisper Test Bench</title>
+<style>
+  :root { --bg:#f6f6f4; --card:#fff; --ink:#1d1d1b; --muted:#6b6b66; --line:#deddd8;
+          --accent:#2f5bd3; --rec:#c8322c; --yes:#23824a; --no:#b23b33; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.45 system-ui, sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:20px; margin:0 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:20px; margin-bottom:16px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .muted { color:var(--muted); font-size:14px; }
+  select, button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:#fff; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.rec { background:var(--rec); color:#fff; border-color:var(--rec); }
+  button.yes { background:var(--yes); color:#fff; border-color:var(--yes); min-width:90px; }
+  button.no  { background:var(--no);  color:#fff; border-color:var(--no);  min-width:90px; }
+  .transcript { font-size:20px; background:var(--bg); border-radius:8px; padding:12px 14px; margin:8px 0 16px; min-height:1.5em; }
+  .metrics { display:flex; gap:18px; flex-wrap:wrap; margin-bottom:16px; }
+  .metrics b { display:block; font-size:18px; font-variant-numeric:tabular-nums; }
+  table { width:100%; border-collapse:collapse; font-size:14px; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  td.n, th.n { text-align:right; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Whisper (whisper.cpp) test bench</h1>
+
+  <div class="card">
+    <div class="row">
+      <select id="model"></select>
+      <label class="row muted" style="gap:4px"><input type="checkbox" id="beam"> beam search</label>
+      <button id="load">Load model</button>
+      <span id="modelStatus" class="muted"></span>
+    </div>
+  </div>
+
+  <!-- Step 1: record -->
+  <div class="card" id="askCard">
+    <div class="row">
+      <button id="recBtn" class="primary">Start recording</button>
+      <span id="recStatus" class="muted">or press Space</span>
+    </div>
+  </div>
+
+  <!-- Step 2: confirm -->
+  <div class="card" id="confirmCard" hidden>
+    <div class="muted">Is this what you said?</div>
+    <div class="transcript" id="transcript"></div>
+    <div class="muted" id="raw" style="margin:-8px 0 16px"></div>
+    <div class="metrics muted">
+      <div>Audio<b id="mAudio"></b></div>
+      <div>Inference<b id="mInf"></b></div>
+      <div>Round trip<b id="mRt"></b></div>
+      <div>RTF<b id="mRtf"></b></div>
+    </div>
+    <div class="row">
+      <button class="yes" id="yesBtn">Yes (Y)</button>
+      <button class="no" id="noBtn">No (N)</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:8px">Results so far (saved to results.csv)</div>
+    <table>
+      <thead><tr><th>Model</th><th class="n">Trials</th><th class="n">Correct</th><th class="n">Mean inference</th><th class="n">Mean RTF</th></tr></thead>
+      <tbody id="stats"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let current = null;      // last transcription result
+let recorder = null;     // {ctx, stream, node, chunks}
+let busy = false;
+
+// ---------- model selection ----------
+async function initModels() {
+  const info = await (await fetch("/api/models")).json();
+  $("model").innerHTML = info.choices.map(m => `<option>${m}</option>`).join("");
+  if (info.current) {
+    $("model").value = info.current;
+    $("beam").checked = info.beam_search;
+    $("modelStatus").textContent = `loaded (${info.n_threads} threads)`;
+  } else {
+    $("model").value = "base.en";
+    $("modelStatus").textContent = "not loaded yet (loads on first recording)";
+  }
+}
+
+$("load").onclick = async () => {
+  setBusy(true);
+  $("modelStatus").textContent = "loading (first time also downloads)…";
+  const r = await fetch("/api/model", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({name: $("model").value, beam_search: $("beam").checked}),
+  });
+  const j = await r.json();
+  $("modelStatus").textContent = r.ok ? `loaded in ${j.load_seconds.toFixed(2)} s` : `error: ${j.detail}`;
+  setBusy(false);
+};
+
+function setBusy(b) {
+  busy = b;
+  for (const id of ["load", "model", "beam", "recBtn"]) $(id).disabled = b;
+}
+
+// ---------- recording ----------
+// Capture raw PCM with an AudioWorklet (no codecs, so the server needs no
+// ffmpeg), then resample to 16 kHz in the browser before sending.
+const WORKLET = `
+class Tap extends AudioWorkletProcessor {
+  process(inputs) { if (inputs[0][0]) this.port.postMessage(inputs[0][0].slice()); return true; }
+}
+registerProcessor("tap", Tap);`;
+
+async function startRecording() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    // Browser "voice call" processing can garble speech for ASR; keep it raw.
+    audio: {channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true},
+  });
+  const ctx = new AudioContext();
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], {type: "text/javascript"})));
+  const node = new AudioWorkletNode(ctx, "tap");
+  const chunks = [];
+  node.port.onmessage = e => chunks.push(e.data);
+  ctx.createMediaStreamSource(stream).connect(node);
+  recorder = {ctx, stream, node, chunks, t0: performance.now()};
+  $("recBtn").textContent = "Stop recording";
+  $("recBtn").className = "rec";
+  tickTimer();
+}
+
+function tickTimer() {
+  if (!recorder) return;
+  $("recStatus").textContent = `recording… ${((performance.now() - recorder.t0) / 1000).toFixed(1)} s`;
+  requestAnimationFrame(tickTimer);
+}
+
+async function stopRecording() {
+  const {ctx, stream, node, chunks} = recorder;
+  recorder = null;
+  stream.getTracks().forEach(t => t.stop());
+  node.disconnect();
+  await ctx.close();
+  $("recBtn").textContent = "Start recording";
+  $("recBtn").className = "primary";
+
+  const stopT = performance.now();
+  setBusy(true);
+  $("recStatus").textContent = "transcribing…";
+
+  const pcm16k = await resample(concat(chunks), ctx.sampleRate, 16000);
+  const r = await fetch("/api/transcribe", {method: "POST", body: pcm16k.buffer});
+  const j = await r.json();
+  setBusy(false);
+  if (!r.ok) { $("recStatus").textContent = `error: ${j.detail}`; return; }
+
+  current = {...j, roundtrip_seconds: (performance.now() - stopT) / 1000};
+  $("modelStatus").textContent = `${j.model}${j.beam_search ? " (beam)" : ""}`;
+  showConfirm();
+}
+
+function concat(chunks) {
+  const out = new Float32Array(chunks.reduce((n, c) => n + c.length, 0));
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+
+async function resample(samples, fromRate, toRate) {
+  const off = new OfflineAudioContext(1, Math.ceil(samples.length * toRate / fromRate), toRate);
+  const buf = off.createBuffer(1, samples.length, fromRate);
+  buf.copyToChannel(samples, 0);
+  const src = off.createBufferSource();
+  src.buffer = buf;
+  src.connect(off.destination);
+  src.start();
+  return (await off.startRendering()).getChannelData(0);
+}
+
+$("recBtn").onclick = () => {
+  if (recorder) stopRecording();
+  else startRecording().catch(e => $("recStatus").textContent = `mic error: ${e.message}`);
+};
+
+// ---------- confirm loop ----------
+function showRecord() {
+  $("recStatus").textContent = "or press Space";
+  $("askCard").hidden = false;
+  $("confirmCard").hidden = true;
+}
+
+function showConfirm() {
+  $("transcript").textContent = current.text || "(nothing recognized)";
+  $("raw").textContent = `Whisper output: "${current.raw_text}"`;
+  $("mAudio").textContent = current.audio_seconds.toFixed(1) + " s";
+  $("mInf").textContent = current.inference_seconds.toFixed(2) + " s";
+  $("mRt").textContent = current.roundtrip_seconds.toFixed(2) + " s";
+  $("mRtf").textContent = current.rtf.toFixed(2);
+  $("askCard").hidden = true;
+  $("confirmCard").hidden = false;
+}
+
+async function answer(correct) {
+  await fetch("/api/feedback", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      text: current.text, correct,
+      model: current.model, beam_search: current.beam_search,
+      audio_seconds: current.audio_seconds, inference_seconds: current.inference_seconds,
+      roundtrip_seconds: current.roundtrip_seconds,
+    }),
+  });
+  current = null;
+  refreshStats();
+  showRecord();
+}
+$("yesBtn").onclick = () => answer(true);
+$("noBtn").onclick = () => answer(false);
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT" || e.repeat) return;
+  if (!$("askCard").hidden && e.code === "Space" && !busy) { e.preventDefault(); $("recBtn").click(); }
+  if (!$("confirmCard").hidden && e.key.toLowerCase() === "y") answer(true);
+  if (!$("confirmCard").hidden && e.key.toLowerCase() === "n") answer(false);
+});
+
+async function refreshStats() {
+  const rows = await (await fetch("/api/stats")).json();
+  $("stats").innerHTML = rows.map(r => `<tr><td>${r.model}</td><td class="n">${r.trials}</td>
+    <td class="n">${(r.accuracy * 100).toFixed(0)}%</td>
+    <td class="n">${r.mean_inference_seconds.toFixed(2)} s</td><td class="n">${r.mean_rtf.toFixed(2)}</td></tr>`).join("")
+    || `<tr><td colspan="5" class="muted">No answers yet</td></tr>`;
+}
+
+initModels();
+refreshStats();
+showRecord();
+</script>
+</body>
+</html>
